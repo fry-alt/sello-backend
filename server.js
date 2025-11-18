@@ -13,23 +13,26 @@ const yooKassa = new YooKassa({
   secretKey: process.env.YOOKASSA_SECRET_KEY,
 });
 
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
+// middlewares
 app.use(cors());
 app.use(express.json());
 
-// --- демо-продавцы ---
+// ================== демо-данные ==================
+
 const SELLERS = [
   { id: "s-01", name: "Store Matvey", city: "Москва" },
   { id: "s-02", name: "Borovsky Retail", city: "Санкт-Петербург" },
   { id: "s-03", name: "Zhuk Select", city: "Казань" },
 ];
 
-// --- демо-товары ---
 const PRODUCTS = [
   {
     id: "p-01",
     title: "Aether Runner V2",
     brand: "Aether",
-    price: 12990, // рубли
+    price: 12990,
     category: "Кроссовки",
     sellerId: "s-01",
     colors: ["Белый", "Графит"],
@@ -90,10 +93,10 @@ const PRODUCTS = [
   },
 ];
 
-// простое хранилище заказов в памяти
 const ORDERS = [];
 
-// пересчёт корзины
+// ================== утилиты ==================
+
 function calcOrderSummary(cart) {
   const items = cart
     .map((ci) => {
@@ -114,17 +117,27 @@ function calcOrderSummary(cart) {
   return { items, total };
 }
 
-// --- healthcheck ---
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res.status(500).json({ error: "ADMIN_TOKEN не задан на сервере" });
+  }
+  const token = req.headers["x-admin-token"];
+  if (!token || token !== ADMIN_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
+// ================== публичные эндпоинты ==================
+
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", service: "sello-backend" });
 });
 
-// --- каталог ---
 app.get("/api/products", (req, res) => {
   res.json({ products: PRODUCTS, sellers: SELLERS });
 });
 
-// --- создание заказа + платеж ЮKassa ---
 app.post("/api/orders", async (req, res) => {
   try {
     const { cart, customer } = req.body || {};
@@ -149,26 +162,26 @@ app.post("/api/orders", async (req, res) => {
       total,
       customer: customer || { type: "guest" },
       status: "pending",
+      paymentStatus: "pending",
       createdAt: new Date().toISOString(),
     };
 
     ORDERS.push(order);
 
-    // чек для ЮKassa
     const receipt = {
       customer: {
         email:
           (customer && customer.email) ||
-          "test@example.com", // заглушка, потом заменишь на реальный email покупателя
+          "test@example.com", // потом заменишь на реальный email
       },
       items: items.map((i) => ({
         description: i.title || "Товар",
-        quantity: i.qty, // число
+        quantity: i.qty,
         amount: {
-          value: i.price.toFixed(2), // строка, например "12990.00"
+          value: i.price.toFixed(2),
           currency: "RUB",
         },
-        vat_code: 1, // заглушка, проверь нужный код НДС в кабинете ЮKassa
+        vat_code: 1,
       })),
     };
 
@@ -182,7 +195,7 @@ app.post("/api/orders", async (req, res) => {
         type: "redirect",
         return_url: process.env.YOOKASSA_RETURN_URL,
       },
-      description: `Sello: заказ ${orderId}`,
+      description: `SelloMarket: заказ ${orderId}`,
       metadata: {
         orderId,
       },
@@ -205,6 +218,7 @@ app.post("/api/orders", async (req, res) => {
       total,
       items,
       status: order.status,
+      paymentStatus: order.paymentStatus,
       paymentUrl,
     });
   } catch (err) {
@@ -213,11 +227,81 @@ app.post("/api/orders", async (req, res) => {
   }
 });
 
-// --- просмотр заказа по id (на будущее) ---
 app.get("/api/orders/:orderId", (req, res) => {
   const order = ORDERS.find((o) => o.id === req.params.orderId);
   if (!order) return res.status(404).json({ error: "Заказ не найден" });
   res.json(order);
+});
+
+// ================== webhook ЮKassa ==================
+
+app.post(
+  "/api/yookassa/webhook",
+  express.json({ type: "application/json" }),
+  (req, res) => {
+    try {
+      const event = req.body;
+      const payment = event && event.object;
+      if (!payment || !payment.metadata || !payment.metadata.orderId) {
+        console.log("Webhook без orderId:", event);
+        return res.status(200).send("ignored");
+      }
+
+      const { orderId } = payment.metadata;
+      const status = payment.status; // pending, waiting_for_capture, succeeded, canceled...
+
+      const order = ORDERS.find((o) => o.id === orderId);
+      if (!order) {
+        console.log("Webhook: заказ не найден", orderId);
+        return res.status(200).send("ok");
+      }
+
+      order.paymentStatus = status;
+      if (status === "succeeded") {
+        order.status = "paid";
+      } else if (status === "canceled") {
+        order.status = "canceled";
+      }
+
+      console.log("Webhook: обновлён заказ", orderId, "=>", order.status);
+      res.status(200).send("ok");
+    } catch (e) {
+      console.error("Ошибка обработки вебхука ЮKassa:", e);
+      res.status(200).send("error");
+    }
+  }
+);
+
+// ================== АДМИН-ЭНДПОИНТЫ ==================
+
+// список всех заказов
+app.get("/api/admin/orders", requireAdmin, (req, res) => {
+  const safeOrders = ORDERS.map((o) => ({
+    id: o.id,
+    total: o.total,
+    status: o.status,
+    paymentStatus: o.paymentStatus || null,
+    createdAt: o.createdAt,
+    customer: o.customer,
+    items: o.items,
+  }));
+  res.json({ orders: safeOrders });
+});
+
+// обновление статуса заказа вручную
+app.patch("/api/admin/orders/:orderId", requireAdmin, (req, res) => {
+  const order = ORDERS.find((o) => o.id === req.params.orderId);
+  if (!order) return res.status(404).json({ error: "Заказ не найден" });
+
+  const { status } = req.body || {};
+  const allowed = ["pending", "paid", "canceled", "shipped", "completed"];
+
+  if (!status || !allowed.includes(status)) {
+    return res.status(400).json({ error: "Некорректный статус" });
+  }
+
+  order.status = status;
+  res.json({ ok: true, order });
 });
 
 app.listen(PORT, () => {
