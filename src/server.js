@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
-const { YooKassa } = require("yookassa");
+const YooKassa = require("yookassa");
 const { Pool } = require("pg");
 
 dotenv.config();
@@ -376,3 +376,4 @@ initDb()
     console.error("Ошибка инициализации БД:", e);
     process.exit(1);
   });
+
